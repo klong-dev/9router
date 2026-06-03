@@ -11,6 +11,24 @@ import { normalizeResponsesInput } from "../helpers/responsesApiHelper.js";
 // Responses API enforces max 64 chars on call_id (#393)
 const MAX_CALL_ID_LEN = 64;
 const clampCallId = (id) => (typeof id === "string" && id.length > MAX_CALL_ID_LEN ? id.substring(0, MAX_CALL_ID_LEN) : id);
+const WEB_SEARCH_TOOL_TYPES = /^web_search/;
+
+function isWebSearchTool(tool) {
+  return typeof tool?.type === "string" && WEB_SEARCH_TOOL_TYPES.test(tool.type);
+}
+
+function isWebSearchToolChoice(choice) {
+  return choice?.type === "web_search" || (choice?.type === "tool" && choice?.name === "web_search");
+}
+
+function convertToolChoiceToResponses(choice) {
+  if (!choice || typeof choice === "string") return choice;
+  if (isWebSearchToolChoice(choice)) return { type: "web_search" };
+  if (choice.type === "function" && choice.function?.name) {
+    return { type: "function", name: choice.function.name };
+  }
+  return choice;
+}
 
 /**
  * Convert OpenAI Responses API request to OpenAI Chat Completions format
@@ -29,9 +47,23 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
   // Group items by conversation turn
   let currentAssistantMsg = null;
   let pendingToolResults = [];
+  let pendingReasoning = "";
 
   const inputItems = normalizeResponsesInput(body.input);
   if (!inputItems) return body;
+
+  // Extract reasoning text from summary[].text or encrypted_content fallback
+  const extractReasoningText = (item) => {
+    if (Array.isArray(item.summary)) {
+      const txt = item.summary.map(s => s?.text || "").filter(Boolean).join("\n");
+      if (txt) return txt;
+    }
+    if (Array.isArray(item.content)) {
+      const txt = item.content.map(c => c?.text || "").filter(Boolean).join("\n");
+      if (txt) return txt;
+    }
+    return "";
+  };
 
   for (const item of inputItems) {
     // Determine item type - Droid CLI sends role-based items without 'type' field
@@ -64,7 +96,13 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
           return c;
         })
         : item.content;
-      result.messages.push({ role: item.role, content });
+      const msg = { role: item.role, content };
+      // Attach buffered reasoning to assistant turn (required by xiaomi-mimo thinking mode)
+      if (item.role === "assistant" && pendingReasoning) {
+        msg.reasoning_content = pendingReasoning;
+      }
+      pendingReasoning = "";
+      result.messages.push(msg);
     }
     else if (itemType === "function_call") {
       // Start or append to assistant message with tool_calls
@@ -74,6 +112,10 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
           content: null,
           tool_calls: []
         };
+        if (pendingReasoning) {
+          currentAssistantMsg.reasoning_content = pendingReasoning;
+          pendingReasoning = "";
+        }
       }
       // Skip items with empty/missing name — Codex/OpenAI reject nameless tool calls (#444)
       if (!item.name || typeof item.name !== "string" || item.name.trim() === "") continue;
@@ -107,7 +149,9 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
       });
     }
     else if (itemType === "reasoning") {
-      // Skip reasoning items - they are for display only
+      // Buffer reasoning text; attached to next assistant message/function_call
+      const txt = extractReasoningText(item);
+      if (txt) pendingReasoning = pendingReasoning ? `${pendingReasoning}\n${txt}` : txt;
       continue;
     }
   }
@@ -130,6 +174,7 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
   if (body.tools && Array.isArray(body.tools)) {
     result.tools = body.tools
       .map(tool => {
+        if (isWebSearchTool(tool)) return tool;
         // Already in Chat Completions format: { type: "function", function: { name, ... } }
         if (tool.function) return tool;
         // Responses API function tool: { type: "function", name, description, parameters }
@@ -266,6 +311,7 @@ export function openaiToOpenAIResponsesRequest(model, body, stream, credentials)
   // Convert tools format
   if (body.tools && Array.isArray(body.tools)) {
     result.tools = body.tools.map(tool => {
+      if (isWebSearchTool(tool)) return tool;
       if (tool.type === "function") {
         return {
           type: "function",
@@ -277,6 +323,10 @@ export function openaiToOpenAIResponsesRequest(model, body, stream, credentials)
       }
       return tool;
     });
+  }
+
+  if (body.tool_choice !== undefined) {
+    result.tool_choice = convertToolChoiceToResponses(body.tool_choice);
   }
 
   // Pass through other relevant fields

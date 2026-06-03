@@ -5,6 +5,63 @@
 import { register } from "../index.js";
 import { FORMATS } from "../formats.js";
 import { v4 as uuidv4 } from "uuid";
+import {
+  resolveKiroModel,
+  isThinkingEnabled,
+  buildThinkingSystemPrefix,
+  KIRO_AGENTIC_SYSTEM_PROMPT
+} from "../../config/kiroConstants.js";
+
+/**
+ * Recursively sanitize a JSON Schema for Kiro upstream.
+ *
+ * Kiro / AWS CodeWhisperer rejects requests with vague
+ * "Improperly formed request" when tool input schemas contain certain
+ * fields. This mirrors the sanitization done by kiro-gateway
+ * (see kiro/converters_core.py::sanitize_json_schema):
+ *
+ *   - drops `additionalProperties` (not supported)
+ *   - drops empty `required: []` (rejected as malformed)
+ *   - recurses into `properties`, nested objects, and array entries
+ *     (anyOf/oneOf/allOf)
+ *
+ * @param {any} schema
+ * @returns {object}
+ */
+function sanitizeKiroSchema(schema) {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) {
+    return schema || {};
+  }
+  const out = {};
+  for (const [key, value] of Object.entries(schema)) {
+    if (key === "additionalProperties") continue;
+    if (key === "required" && Array.isArray(value) && value.length === 0) continue;
+    if (key === "properties" && value && typeof value === "object") {
+      const props = {};
+      for (const [pName, pVal] of Object.entries(value)) {
+        props[pName] = pVal && typeof pVal === "object" && !Array.isArray(pVal)
+          ? sanitizeKiroSchema(pVal)
+          : pVal;
+      }
+      out[key] = props;
+      continue;
+    }
+    if (Array.isArray(value)) {
+      out[key] = value.map(item =>
+        item && typeof item === "object" && !Array.isArray(item)
+          ? sanitizeKiroSchema(item)
+          : item
+      );
+      continue;
+    }
+    if (value && typeof value === "object") {
+      out[key] = sanitizeKiroSchema(value);
+      continue;
+    }
+    out[key] = value;
+  }
+  return out;
+}
 
 /**
  * Convert OpenAI messages to Kiro format
@@ -49,19 +106,40 @@ function convertMessages(messages, tools, model) {
         if (!userMsg.userInputMessage.userInputMessageContext) {
           userMsg.userInputMessage.userInputMessageContext = {};
         }
+
+        // Validate tool names against Kiro 64-char limit and log offenders.
+        // Kiro upstream returns generic "Improperly formed request" for any
+        // tool spec issue, so we surface the real cause here.
+        const longNames = [];
+        for (const t of tools) {
+          const n = t.function?.name || t.name || "";
+          if (n.length > 64) longNames.push({ name: n, length: n.length });
+        }
+        if (longNames.length > 0) {
+          // eslint-disable-next-line no-console
+          console.warn(
+            `[Kiro] Tool name(s) exceed 64-char limit (${longNames.length} offender(s)):\n` +
+              longNames.map(x => `  - '${x.name}' (${x.length} chars)`).join("\n")
+          );
+        }
+
         userMsg.userInputMessage.userInputMessageContext.tools = tools.map(t => {
           const name = t.function?.name || t.name;
           let description = t.function?.description || t.description || "";
-          
+
           if (!description.trim()) {
             description = `Tool: ${name}`;
           }
-          
+
           const schema = t.function?.parameters || t.parameters || t.input_schema || {};
-          // Normalize schema: Kiro requires required[] and proper type/properties
-          const normalizedSchema = Object.keys(schema).length === 0
-            ? { type: "object", properties: {}, required: [] }
-            : { ...schema, required: schema.required ?? [] };
+          // Sanitize schema for Kiro:
+          //  - strip `additionalProperties` (Kiro rejects it)
+          //  - drop empty `required: []` (Kiro rejects empty arrays)
+          //  - ensure type/properties exist for empty schemas
+          const sanitized = sanitizeKiroSchema(schema);
+          const normalizedSchema = Object.keys(sanitized).length === 0
+            ? { type: "object", properties: {} }
+            : sanitized;
 
           return {
             toolSpecification: {
@@ -282,6 +360,20 @@ function convertMessages(messages, tools, model) {
 
 /**
  * Build Kiro payload from OpenAI format
+ *
+ * Two 9router-specific behaviours implemented here:
+ *
+ * 1. `-agentic` model suffix. Synthetic variant — same upstream model, but we
+ *    inject a chunked-write system prompt to keep large file writes under
+ *    Kiro's 2-3 minute server timeout. The suffix is stripped before being
+ *    sent upstream.
+ *
+ * 2. Thinking / reasoning. Kiro does not accept `thinking.type` or
+ *    `reasoning_effort` natively. The only way to enable reasoning is to
+ *    inject `<thinking_mode>enabled</thinking_mode>` into the user content
+ *    sent upstream. Detection covers Anthropic-Beta header, Claude API
+ *    `thinking`, OpenAI `reasoning_effort`, AMP/Cursor magic tags, and model
+ *    name hints.
  */
 export function buildKiroPayload(model, body, stream, credentials) {
   const messages = body.messages || [];
@@ -290,14 +382,29 @@ export function buildKiroPayload(model, body, stream, credentials) {
   const temperature = body.temperature;
   const topP = body.top_p;
 
-  const { history, currentMessage } = convertMessages(messages, tools, model);
+  const { upstream: upstreamModel, agentic, thinking: modelImpliesThinking } = resolveKiroModel(model);
+  const thinkingEnabled = modelImpliesThinking || isThinkingEnabled(body, null, model);
+
+  const { history, currentMessage } = convertMessages(messages, tools, upstreamModel);
 
   const profileArn = credentials?.providerSpecificData?.profileArn || "";
 
   let finalContent = currentMessage?.userInputMessage?.content || "";
   const timestamp = new Date().toISOString();
-  finalContent = `[Context: Current time is ${timestamp}]\n\n${finalContent}`;
-  
+
+  // Build the system-prompt prefix that goes ABOVE the user message body.
+  // Order: thinking_mode tag first (so Kiro sees it before any user text),
+  // then context/timestamp marker, then optional agentic chunked-write prompt.
+  const prefixParts = [];
+  if (thinkingEnabled) {
+    prefixParts.push(buildThinkingSystemPrefix());
+  }
+  prefixParts.push(`[Context: Current time is ${timestamp}]`);
+  if (agentic) {
+    prefixParts.push(KIRO_AGENTIC_SYSTEM_PROMPT);
+  }
+  finalContent = `${prefixParts.join("\n\n")}\n\n${finalContent}`;
+
   const payload = {
     conversationState: {
       chatTriggerType: "MANUAL",
@@ -305,8 +412,11 @@ export function buildKiroPayload(model, body, stream, credentials) {
       currentMessage: {
         userInputMessage: {
           content: finalContent,
-          modelId: model,
+          modelId: upstreamModel,
           origin: "AI_EDITOR",
+          ...(currentMessage?.userInputMessage?.images?.length > 0 && {
+            images: currentMessage.userInputMessage.images
+          }),
           ...(currentMessage?.userInputMessage?.userInputMessageContext && {
             userInputMessageContext: currentMessage.userInputMessage.userInputMessageContext
           })
@@ -326,6 +436,12 @@ export function buildKiroPayload(model, body, stream, credentials) {
     if (temperature !== undefined) payload.inferenceConfig.temperature = temperature;
     if (topP !== undefined) payload.inferenceConfig.topP = topP;
   }
+
+  // Tag payload so the executor can route the upstream model id correctly.
+  Object.defineProperty(payload, "_kiroUpstreamModel", {
+    value: upstreamModel,
+    enumerable: false
+  });
 
   return payload;
 }
