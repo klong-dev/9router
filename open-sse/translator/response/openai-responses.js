@@ -4,6 +4,13 @@
  */
 import { register } from "../index.js";
 import { FORMATS } from "../formats.js";
+import { buildChunk } from "../concerns/chunk.js";
+import { buildUsage } from "../concerns/usage.js";
+import { fallbackToolCallId } from "../concerns/toolCall.js";
+import { reasoningDelta, extractReasoningText } from "../concerns/reasoning.js";
+import { ROLE, OPENAI_BLOCK, RESPONSES_ITEM, OPENAI_FINISH, MODEL_FALLBACK } from "../schema/index.js";
+import { openaiToClaudeResponse } from "./openai-to-claude.js";
+import { isContextWindowError } from "../../utils/error.js";
 
 /**
  * Translate OpenAI chunk to Responses API events
@@ -57,10 +64,11 @@ export function openaiToOpenAIResponsesResponse(chunk, state) {
     });
   }
 
-  // Handle reasoning_content
-  if (delta.reasoning_content) {
+  // Handle reasoning across vendor shapes (reasoning_content / reasoning / reasoning_details)
+  const reasoningText = extractReasoningText(delta);
+  if (reasoningText) {
     startReasoning(state, emit, idx);
-    emitReasoningDelta(state, emit, delta.reasoning_content);
+    emitReasoningDelta(state, emit, reasoningText);
   }
 
   // Handle text content
@@ -121,7 +129,7 @@ function startReasoning(state, emit, idx) {
     emit("response.output_item.added", {
       type: "response.output_item.added",
       output_index: idx,
-      item: { id: state.reasoningId, type: "reasoning", summary: [] }
+      item: { id: state.reasoningId, type: RESPONSES_ITEM.REASONING, summary: [] }
     });
 
     emit("response.reasoning_summary_part.added", {
@@ -129,7 +137,7 @@ function startReasoning(state, emit, idx) {
       item_id: state.reasoningId,
       output_index: idx,
       summary_index: 0,
-      part: { type: "summary_text", text: "" }
+      part: { type: RESPONSES_ITEM.SUMMARY_TEXT, text: "" }
     });
     state.reasoningPartAdded = true;
   }
@@ -164,7 +172,7 @@ function closeReasoning(state, emit) {
       item_id: state.reasoningId,
       output_index: state.reasoningIndex,
       summary_index: 0,
-      part: { type: "summary_text", text: state.reasoningBuf }
+      part: { type: RESPONSES_ITEM.SUMMARY_TEXT, text: state.reasoningBuf }
     });
 
     emit("response.output_item.done", {
@@ -172,8 +180,8 @@ function closeReasoning(state, emit) {
       output_index: state.reasoningIndex,
       item: {
         id: state.reasoningId,
-        type: "reasoning",
-        summary: [{ type: "summary_text", text: state.reasoningBuf }]
+        type: RESPONSES_ITEM.REASONING,
+        summary: [{ type: RESPONSES_ITEM.SUMMARY_TEXT, text: state.reasoningBuf }]
       }
     });
   }
@@ -187,7 +195,7 @@ function emitTextContent(state, emit, idx, content) {
     emit("response.output_item.added", {
       type: "response.output_item.added",
       output_index: idx,
-      item: { id: msgId, type: "message", content: [], role: "assistant" }
+      item: { id: msgId, type: RESPONSES_ITEM.MESSAGE, content: [], role: ROLE.ASSISTANT }
     });
   }
 
@@ -199,7 +207,7 @@ function emitTextContent(state, emit, idx, content) {
       item_id: `msg_${state.responseId}_${idx}`,
       output_index: idx,
       content_index: 0,
-      part: { type: "output_text", annotations: [], logprobs: [], text: "" }
+      part: { type: RESPONSES_ITEM.OUTPUT_TEXT, annotations: [], logprobs: [], text: "" }
     });
   }
 
@@ -236,7 +244,7 @@ function closeMessage(state, emit, idx) {
       item_id: msgId,
       output_index: parseInt(idx),
       content_index: 0,
-      part: { type: "output_text", annotations: [], logprobs: [], text: fullText }
+      part: { type: RESPONSES_ITEM.OUTPUT_TEXT, annotations: [], logprobs: [], text: fullText }
     });
 
     emit("response.output_item.done", {
@@ -244,9 +252,9 @@ function closeMessage(state, emit, idx) {
       output_index: parseInt(idx),
       item: {
         id: msgId,
-        type: "message",
-        content: [{ type: "output_text", annotations: [], logprobs: [], text: fullText }],
-        role: "assistant"
+        type: RESPONSES_ITEM.MESSAGE,
+        content: [{ type: RESPONSES_ITEM.OUTPUT_TEXT, annotations: [], logprobs: [], text: fullText }],
+        role: ROLE.ASSISTANT
       }
     });
   }
@@ -267,7 +275,7 @@ function emitToolCall(state, emit, tc) {
       output_index: tcIdx,
       item: {
         id: `fc_${newCallId}`,
-        type: "function_call",
+        type: RESPONSES_ITEM.FUNCTION_CALL,
         arguments: "",
         call_id: newCallId,
         name: state.funcNames[tcIdx] || ""
@@ -308,7 +316,7 @@ function closeToolCall(state, emit, idx) {
       output_index: parseInt(idx),
       item: {
         id: `fc_${callId}`,
-        type: "function_call",
+        type: RESPONSES_ITEM.FUNCTION_CALL,
         arguments: args,
         call_id: callId,
         name: state.funcNames[idx] || ""
@@ -359,8 +367,8 @@ function flushEvents(state) {
   // can still finalize as tool_calls even if the tool call was emitted before stream end.
 function computeFinishReason(state) {
    return state.toolCallIndex > 0 || state.currentToolCallId
-    ? "tool_calls"
-    : "stop";
+    ? OPENAI_FINISH.TOOL_CALLS
+    : OPENAI_FINISH.STOP;
 }
 
 /**
@@ -377,17 +385,11 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
     state.finishReasonSent = true;
     state.finishReason = finishReason;
 
-    const finalChunk = {
-      id: state.chatId || `chatcmpl-${Date.now()}`,
-      object: "chat.completion.chunk",
-      created: state.created || Math.floor(Date.now() / 1000),
-      model: state.model || "unknown",
-      choices: [{
-        index: 0,
-        delta: {},
-        finish_reason: finishReason
-      }]
-    };
+    const finalChunk = buildChunk(
+      { id: state.chatId || `chatcmpl-${Date.now()}`, created: state.created || Math.floor(Date.now() / 1000), model: state.model || MODEL_FALLBACK },
+      {},
+      finishReason
+    );
 
     if (state.usage && typeof state.usage === "object") {
       finalChunk.usage = state.usage;
@@ -414,17 +416,10 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
     const delta = data.delta || "";
     if (!delta) return null;
 
-    return {
-      id: state.chatId,
-      object: "chat.completion.chunk",
-      created: state.created,
-      model: state.model || "unknown",
-      choices: [{
-        index: 0,
-        delta: { content: delta },
-        finish_reason: null
-      }]
-    };
+    return buildChunk(
+      { id: state.chatId, created: state.created, model: state.model || MODEL_FALLBACK },
+      { content: delta }
+    );
   }
 
   // Text content done (ignore, we handle via delta)
@@ -433,31 +428,21 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
   }
 
   // Function call started (standard function_call or custom_tool_call)
-  if (eventType === "response.output_item.added" && (data.item?.type === "function_call" || data.item?.type === "custom_tool_call")) {
+  if (eventType === "response.output_item.added" && (data.item?.type === RESPONSES_ITEM.FUNCTION_CALL || data.item?.type === "custom_tool_call")) {
     const item = data.item;
-    state.currentToolCallId = item.call_id || `call_${Date.now()}`;
+    state.currentToolCallId = item.call_id || fallbackToolCallId();
 
-    return {
-      id: state.chatId,
-      object: "chat.completion.chunk",
-      created: state.created,
-      model: state.model || "unknown",
-      choices: [{
-        index: 0,
-        delta: {
-          tool_calls: [{
-            index: state.toolCallIndex,
-            id: state.currentToolCallId,
-            type: "function",
-            function: {
-              name: item.name || "",
-              arguments: ""
-            }
-          }]
-        },
-        finish_reason: null
-      }]
-    };
+    return buildChunk(
+      { id: state.chatId, created: state.created, model: state.model || MODEL_FALLBACK },
+      {
+        tool_calls: [{
+          index: state.toolCallIndex,
+          id: state.currentToolCallId,
+          type: OPENAI_BLOCK.FUNCTION,
+          function: { name: item.name || "", arguments: "" }
+        }]
+      }
+    );
   }
 
   // Function call arguments delta (standard or custom_tool_call variant)
@@ -465,32 +450,20 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
     const argsDelta = data.delta || "";
     if (!argsDelta) return null;
 
-    return {
-      id: state.chatId,
-      object: "chat.completion.chunk",
-      created: state.created,
-      model: state.model || "unknown",
-      choices: [{
-        index: 0,
-        delta: {
-          tool_calls: [{
-            index: state.toolCallIndex,
-            function: { arguments: argsDelta }
-          }]
-        },
-        finish_reason: null
-      }]
-    };
+    return buildChunk(
+      { id: state.chatId, created: state.created, model: state.model || MODEL_FALLBACK },
+      { tool_calls: [{ index: state.toolCallIndex, function: { arguments: argsDelta } }] }
+    );
   }
 
   // Function call done (standard or custom_tool_call variant)
-  if (eventType === "response.output_item.done" && (data.item?.type === "function_call" || data.item?.type === "custom_tool_call")) {
+  if (eventType === "response.output_item.done" && (data.item?.type === RESPONSES_ITEM.FUNCTION_CALL || data.item?.type === "custom_tool_call")) {
     state.toolCallIndex++;
     return null;
   }
 
   // Response completed
-  if (eventType === "response.completed") {
+  if (eventType === "response.completed" || eventType === "response.done") {
     // Extract usage from response.completed event
     const responseUsage = data.response?.usage;
     if (responseUsage && typeof responseUsage === "object") {
@@ -500,18 +473,7 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
       // Cache info is in input_tokens_details.cached_tokens
       const cacheReadTokens = responseUsage.input_tokens_details?.cached_tokens || responseUsage.cache_read_input_tokens || 0;
       
-      state.usage = {
-        prompt_tokens: inputTokens,
-        completion_tokens: outputTokens,
-        total_tokens: inputTokens + outputTokens
-      };
-      
-      // Add prompt_tokens_details if cache tokens exist
-      if (cacheReadTokens > 0) {
-        state.usage.prompt_tokens_details = {
-          cached_tokens: cacheReadTokens
-        };
-      }
+      state.usage = buildUsage({ promptTokens: inputTokens, completionTokens: outputTokens, totalTokens: inputTokens + outputTokens, cachedTokens: cacheReadTokens });
     }
     
     if (!state.finishReasonSent) {
@@ -520,18 +482,12 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
       state.finishReasonSent = true;
       state.finishReason = finishReason; // Mark for usage injection in stream.js
       
-      const finalChunk = {
-        id: state.chatId,
-        object: "chat.completion.chunk",
-        created: state.created,
-        model: state.model || "unknown",
-        choices: [{
-          index: 0,
-          delta: {},
-          finish_reason: finishReason
-        }]
-      };
-      
+      const finalChunk = buildChunk(
+        { id: state.chatId, created: state.created, model: state.model || MODEL_FALLBACK },
+        {},
+        finishReason
+      );
+
       // Include usage in final chunk if available
       if (state.usage && typeof state.usage === "object") {
         finalChunk.usage = state.usage;
@@ -552,18 +508,7 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
       state.error = error;
       state.finishReasonSent = true;
 
-      // Surface the error as an OpenAI-compatible error chunk
-      return {
-        id: state.chatId || `chatcmpl-${Date.now()}`,
-        object: "chat.completion.chunk",
-        created: state.created || Math.floor(Date.now() / 1000),
-        model: state.model || "unknown",
-        choices: [{
-          index: 0,
-          delta: { content: `[Error] ${error.message || JSON.stringify(error)}` },
-          finish_reason: "stop"
-        }]
-      };
+      return buildOpenAIErrorChunk(error, state);
     }
     return null;
   }
@@ -572,19 +517,71 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
   if (eventType === "response.reasoning_summary_text.delta") {
     const delta = data.delta || "";
     if (!delta) return null;
-    return {
-      id: state.chatId,
-      object: "chat.completion.chunk",
-      created: state.created,
-      model: state.model || "unknown",
-      choices: [{ index: 0, delta: { reasoning_content: delta }, finish_reason: null }]
-    };
+    return buildChunk(
+      { id: state.chatId, created: state.created, model: state.model || MODEL_FALLBACK },
+      reasoningDelta(delta)
+    );
   }
 
   // Ignore other events
   return null;
 }
 
+function extractResponseError(chunk) {
+  const data = chunk?.data || chunk || {};
+  return data.error || data.response?.error || null;
+}
+
+function errorMessage(error) {
+  return error?.message || (error ? JSON.stringify(error) : "OpenAI Responses stream failed");
+}
+
+function buildOpenAIErrorChunk(error, state) {
+  const message = errorMessage(error);
+  const meta = {
+    id: state.chatId || `chatcmpl-${Date.now()}`,
+    created: state.created || Math.floor(Date.now() / 1000),
+    model: state.model || MODEL_FALLBACK
+  };
+  // Strict OpenAI clients (e.g. GitHub Copilot Chat) throw "Response contained no
+  // choices" if any chunk lacks `choices`, swallowing the real upstream error. So we
+  // surface the error as a visible content delta, then close with a finish chunk that
+  // also carries `choices`. A bare {error:{...}} envelope (no choices) breaks them.
+  state.finishReason = OPENAI_FINISH.STOP;
+  return [
+    buildChunk(meta, { role: ROLE.ASSISTANT, content: `[Upstream error] ${message}` }),
+    buildChunk(meta, {}, OPENAI_FINISH.STOP)
+  ];
+}
+
+export function openaiResponsesToClaudeResponse(chunk, state) {
+  if (!chunk) return openaiToClaudeResponse(openaiResponsesToOpenAIResponse(chunk, state), state);
+
+  const eventType = chunk.type || chunk.event;
+  if (eventType === "error" || eventType === "response.failed") {
+    if (state.finishReasonSent) return null;
+    const error = extractResponseError(chunk);
+    if (!error) return null;
+
+    state.error = error;
+    state.finishReasonSent = true;
+    const message = errorMessage(error);
+    const status = isContextWindowError(400, message) ? 400 : 500;
+
+    return {
+      type: "error",
+      error: {
+        type: status === 400 ? "invalid_request_error" : "api_error",
+        message
+      }
+    };
+  }
+
+  const openAIChunk = openaiResponsesToOpenAIResponse(chunk, state);
+  return openAIChunk ? openaiToClaudeResponse(openAIChunk, state) : null;
+}
+
 // Register both directions
 register(FORMATS.OPENAI, FORMATS.OPENAI_RESPONSES, null, openaiToOpenAIResponsesResponse);
 register(FORMATS.OPENAI_RESPONSES, FORMATS.OPENAI, null, openaiResponsesToOpenAIResponse);
+register(FORMATS.OPENAI_RESPONSES, FORMATS.CLAUDE, null, openaiResponsesToClaudeResponse);

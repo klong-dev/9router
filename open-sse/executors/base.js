@@ -1,6 +1,7 @@
-import { HTTP_STATUS, RETRY_CONFIG, DEFAULT_RETRY_CONFIG, resolveRetryEntry, FETCH_CONNECT_TIMEOUT_MS } from "../config/runtimeConfig.js";
+import { HTTP_STATUS, RETRY_CONFIG, DEFAULT_RETRY_CONFIG, resolveRetryEntry, resolveFetchConnectTimeoutMs } from "../config/runtimeConfig.js";
 import { proxyAwareFetch } from "../utils/proxyFetch.js";
 import { dbg } from "../utils/debugLog.js";
+import { ANTHROPIC_API_VERSION, OPENAI_COMPAT_BASE, ANTHROPIC_COMPAT_BASE } from "../providers/shared.js";
 
 /**
  * BaseExecutor - Base class for provider executors
@@ -26,13 +27,13 @@ export class BaseExecutor {
 
   buildUrl(model, stream, urlIndex = 0, credentials = null) {
     if (this.provider?.startsWith?.("openai-compatible-")) {
-      const baseUrl = credentials?.providerSpecificData?.baseUrl || "https://api.openai.com/v1";
+      const baseUrl = credentials?.providerSpecificData?.baseUrl || OPENAI_COMPAT_BASE;
       const normalized = baseUrl.replace(/\/$/, "");
       const path = this.provider.includes("responses") ? "/responses" : "/chat/completions";
       return `${normalized}${path}`;
     }
     if (this.provider?.startsWith?.("anthropic-compatible-")) {
-      const baseUrl = credentials?.providerSpecificData?.baseUrl || "https://api.anthropic.com/v1";
+      const baseUrl = credentials?.providerSpecificData?.baseUrl || ANTHROPIC_COMPAT_BASE;
       const normalized = baseUrl.replace(/\/$/, "");
       return `${normalized}/messages`;
     }
@@ -54,7 +55,7 @@ export class BaseExecutor {
         headers["Authorization"] = `Bearer ${credentials.accessToken}`;
       }
       if (!headers["anthropic-version"]) {
-        headers["anthropic-version"] = "2023-06-01";
+        headers["anthropic-version"] = ANTHROPIC_API_VERSION;
       }
     } else {
       // Standard Bearer token auth for other providers
@@ -87,9 +88,7 @@ export class BaseExecutor {
   }
 
   needsRefresh(credentials) {
-    if (!credentials.expiresAt) return false;
-    const expiresAtMs = new Date(credentials.expiresAt).getTime();
-    return expiresAtMs - Date.now() < 5 * 60 * 1000;
+    return shouldRefreshCredentials(this.provider, credentials);
   }
 
   parseError(response, bodyText) {
@@ -102,16 +101,30 @@ export class BaseExecutor {
     let lastStatus = 0;
     const retryAttemptsByUrl = {};
 
-    // Merge default retry config with provider-specific config
+    // Merge default retry config with provider-specific config.
+    // Anthropic-compatible custom proxy pools often fail by slow header response;
+    // pair their longer connect timeout with fewer network retries to avoid
+    // hanging one account for many minutes before account fallback can rotate.
     const retryConfig = { ...DEFAULT_RETRY_CONFIG, ...this.config.retry };
+    if (this.provider?.startsWith?.("anthropic-compatible-") && this.config.retry?.[HTTP_STATUS.BAD_GATEWAY] == null) {
+      retryConfig[HTTP_STATUS.BAD_GATEWAY] = { attempts: 1, delayMs: 2000 };
+    }
 
     // Schedule retry via retryConfig[statusKey]. Returns true when caller should `urlIndex--; continue`
-    const tryRetry = async (urlIndex, statusKey, reason) => {
+    // response (optional) lets a subclass hook compute a dynamic delay (e.g. antigravity Retry-After).
+    const tryRetry = async (urlIndex, statusKey, reason, response = null) => {
       const { attempts, delayMs } = resolveRetryEntry(retryConfig[statusKey]);
       if (attempts <= 0 || retryAttemptsByUrl[urlIndex] >= attempts) return false;
+      // Hook: subclass may derive delay from the response (headers/body). null → skip retry, use fallback.
+      let waitMs = delayMs;
+      if (response && this.computeRetryDelay) {
+        const dynamic = await this.computeRetryDelay(response, retryAttemptsByUrl[urlIndex] + 1, delayMs);
+        if (dynamic === false) return false; // hook vetoes retry (e.g. Retry-After too long)
+        if (dynamic != null) waitMs = dynamic;
+      }
       retryAttemptsByUrl[urlIndex]++;
-      log?.debug?.("RETRY", `${reason} retry ${retryAttemptsByUrl[urlIndex]}/${attempts} after ${delayMs / 1000}s`);
-      await new Promise(resolve => setTimeout(resolve, delayMs));
+      log?.debug?.("RETRY", `${reason} retry ${retryAttemptsByUrl[urlIndex]}/${attempts} after ${waitMs / 1000}s`);
+      await new Promise(resolve => setTimeout(resolve, waitMs));
       return true;
     };
 
@@ -122,15 +135,16 @@ export class BaseExecutor {
 
       if (!retryAttemptsByUrl[urlIndex]) retryAttemptsByUrl[urlIndex] = 0;
 
-      // Abort if upstream doesn't return response headers within FETCH_CONNECT_TIMEOUT_MS
+      // Abort if upstream doesn't return response headers within the configured connect timeout.
+      const connectTimeoutMs = resolveFetchConnectTimeoutMs(this.provider, this.config, credentials);
       const connectCtrl = new AbortController();
-      const connectTimer = setTimeout(() => connectCtrl.abort(new Error("fetch connect timeout")), FETCH_CONNECT_TIMEOUT_MS);
+      const connectTimer = setTimeout(() => connectCtrl.abort(new Error("fetch connect timeout")), connectTimeoutMs);
       const mergedSignal = signal ? AbortSignal.any([signal, connectCtrl.signal]) : connectCtrl.signal;
 
       try {
         const bodyStr = JSON.stringify(transformedBody);
         const fetchT0 = Date.now();
-        dbg("FETCH", `${this.provider.toUpperCase()} → ${url} | body=${bodyStr.length}B | connectTimeout=${FETCH_CONNECT_TIMEOUT_MS}ms`);
+        dbg("FETCH", `${this.provider.toUpperCase()} → ${url} | body=${bodyStr.length}B | connectTimeout=${connectTimeoutMs}ms`);
         const response = await proxyAwareFetch(url, {
           method: "POST",
           headers,
@@ -142,7 +156,7 @@ export class BaseExecutor {
         const cl = response.headers?.get?.("content-length") || "?";
         dbg("FETCH", `${this.provider.toUpperCase()} ← ${response.status} | ttft=${Date.now() - fetchT0}ms | ct=${ct} | cl=${cl}`);
 
-        if (await tryRetry(urlIndex, response.status, `status ${response.status}`)) { urlIndex--; continue; }
+        if (await tryRetry(urlIndex, response.status, `status ${response.status}`, response)) { urlIndex--; continue; }
 
         if (this.shouldRetry(response.status, urlIndex)) {
           log?.debug?.("RETRY", `${response.status} on ${url}, trying fallback ${urlIndex + 1}`);
